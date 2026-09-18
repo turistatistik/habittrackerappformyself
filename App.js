@@ -7,6 +7,7 @@ import {
   Platform,
   Pressable,
   SafeAreaView,
+  Share,
   ScrollView,
   StatusBar,
   StyleSheet,
@@ -136,7 +137,13 @@ function habitStats(state, habit) {
   const totalDays = Math.max(1, Math.floor((endDate - startDate) / 86400000) + 1);
   let completed = 0;
   let streak = 0;
-  let cursor = end;
+  // A missed checkmark should not break an active streak until the day is
+  // actually over. Once today is complete, the streak includes today.
+  let streakStart = end;
+  if (end === todayKey() && !getCompletion(state, habit.id, end)) {
+    streakStart = addDays(end, -1);
+  }
+  let cursor = streakStart;
   while (cursor >= start && getCompletion(state, habit.id, cursor)) {
     streak += 1;
     cursor = addDays(cursor, -1);
@@ -209,6 +216,8 @@ export default function App() {
   const [editingHabit, setEditingHabit] = useState(null);
   const [habitDraft, setHabitDraft] = useState({ name: '', icon: '✅', color: '#ff3b30' });
   const [editorDate, setEditorDate] = useState(null);
+  const [backupModalVisible, setBackupModalVisible] = useState(false);
+  const [backupDraft, setBackupDraft] = useState('');
 
   useEffect(() => {
     (async () => {
@@ -337,6 +346,70 @@ export default function App() {
     ]);
   };
 
+  const moveHabit = (habitId, direction) => {
+    setState((previous) => {
+      const habits = [...previous.habits];
+      const activeIndexes = habits.reduce((indexes, habit, index) => {
+        if (!habit.deletedAt) indexes.push(index);
+        return indexes;
+      }, []);
+      const activePosition = activeIndexes.findIndex((index) => habits[index].id === habitId);
+      const nextPosition = activePosition + direction;
+      if (activePosition < 0 || nextPosition < 0 || nextPosition >= activeIndexes.length) return previous;
+      const index = activeIndexes[activePosition];
+      const nextIndex = activeIndexes[nextPosition];
+      [habits[index], habits[nextIndex]] = [habits[nextIndex], habits[index]];
+      return { ...previous, habits };
+    });
+  };
+
+  const exportBackup = async () => {
+    const backup = JSON.stringify({
+      app: 'habit-tracker',
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      ...state,
+    }, null, 2);
+    try {
+      await Share.share({
+        title: 'Habit Tracker backup',
+        message: backup,
+      });
+    } catch (error) {
+      Alert.alert('Export failed', 'The backup could not be shared from this device.');
+    }
+  };
+
+  const importBackup = () => {
+    let parsed;
+    try {
+      parsed = JSON.parse(backupDraft);
+    } catch (error) {
+      Alert.alert('Invalid backup', 'Paste the complete JSON backup file, then try again.');
+      return;
+    }
+    if (!Array.isArray(parsed?.habits) || typeof parsed?.completions !== 'object') {
+      Alert.alert('Invalid backup', 'This does not look like a Habit Tracker backup.');
+      return;
+    }
+    Alert.alert(
+      'Replace local data?',
+      'Importing will replace the habits, history, theme, and reminder setting currently stored on this device.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Import',
+          style: 'destructive',
+          onPress: () => {
+            setState(normalizeState(parsed));
+            setBackupDraft('');
+            setBackupModalVisible(false);
+          },
+        },
+      ],
+    );
+  };
+
   if (!loaded) {
     return (
       <SafeAreaView style={styles.safeArea}>
@@ -356,6 +429,7 @@ export default function App() {
             state={state}
             accent={accent}
             toggleHabit={toggleHabit}
+            onAdd={openAddHabit}
           />
         )}
         {tab === 'Stats' && (
@@ -374,6 +448,16 @@ export default function App() {
             onAdd={openAddHabit}
             onEdit={openEditHabit}
             onDelete={deleteHabit}
+            onRestore={(habitId) => setState((previous) => ({
+              ...previous,
+              habits: previous.habits.map((habit) => habit.id === habitId ? { ...habit, deletedAt: null } : habit),
+            }))}
+            onMove={moveHabit}
+            onExport={exportBackup}
+            onImport={() => {
+              setBackupDraft('');
+              setBackupModalVisible(true);
+            }}
             setAccent={(value) => setState((previous) => ({ ...previous, accentColor: value }))}
             notificationsEnabled={state.notificationsEnabled}
             setNotificationsEnabled={(value) => setState((previous) => ({ ...previous, notificationsEnabled: value }))}
@@ -410,6 +494,14 @@ export default function App() {
         onClose={() => setModalVisible(false)}
         onSave={saveHabit}
       />
+
+      <BackupModal
+        visible={backupModalVisible}
+        draft={backupDraft}
+        setDraft={setBackupDraft}
+        onClose={() => setBackupModalVisible(false)}
+        onImport={importBackup}
+      />
     </SafeAreaView>
   );
 }
@@ -423,7 +515,7 @@ function ScreenHeader({ title, subtitle }) {
   );
 }
 
-function TodayScreen({ state, accent, toggleHabit }) {
+function TodayScreen({ state, accent, toggleHabit, onAdd }) {
   const key = todayKey();
   const activeHabits = state.habits.filter((habit) => isHabitActiveOnDate(habit, key) && !habit.deletedAt);
   const completed = activeHabits.filter((habit) => getCompletion(state, habit.id, key)).length;
@@ -441,10 +533,17 @@ function TodayScreen({ state, accent, toggleHabit }) {
 
   return (
     <ScrollView contentContainerStyle={styles.scrollContent} showsVerticalScrollIndicator={false}>
-      <ScreenHeader
-        title="Today"
-        subtitle={formatDate(key, { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' })}
-      />
+      <View style={styles.todayHeaderRow}>
+        <View style={{ flex: 1 }}>
+          <ScreenHeader
+            title="Today"
+            subtitle={formatDate(key, { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' })}
+          />
+        </View>
+        <Pressable onPress={onAdd} style={[styles.headerAddButton, { backgroundColor: accent }]}>
+          <Text style={styles.headerAddText}>＋ Add</Text>
+        </Pressable>
+      </View>
 
       <Animated.View style={[styles.progressCard, { transform: [{ scale: progressAnim.interpolate({ inputRange: [0, 100], outputRange: [0.985, 1], extrapolate: 'clamp' }) }] }]}>
         <View style={styles.progressHeader}>
@@ -487,7 +586,7 @@ function TodayScreen({ state, accent, toggleHabit }) {
         />
       ))}
 
-      <Text style={styles.footerHint}>Past days are available and editable from the full calendar in Statistics.</Text>
+      <Text style={styles.footerHint}>Past days are available and editable from the full calendar in Statistics. An unfinished streak stays active until the end of today.</Text>
     </ScrollView>
   );
 }
@@ -620,7 +719,7 @@ function StatsScreen({ state, accent, calendarMonth, setCalendarMonth, onOpenDay
                 <View style={[styles.habitIcon, { backgroundColor: color + '20' }]}><Text style={styles.habitIconText}>{habit.icon || '✅'}</Text></View>
                 <View>
                   <Text style={styles.habitName}>{habit.name}</Text>
-                  <Text style={styles.muted}>{stats.completed}/{stats.totalDays} days · {stats.streak} day streak</Text>
+                   <Text style={styles.muted}>{stats.completed}/{stats.totalDays} days · {stats.streak} day streak until end of day</Text>
                 </View>
               </View>
               <Text style={[styles.habitPercent, { color }]}>{stats.percent}%</Text>
@@ -673,7 +772,22 @@ function DayEditorModal({ visible, dateKey, state, accent, onClose, onToggle }) 
   );
 }
 
-function SettingsScreen({ state, accent, onAdd, onEdit, onDelete, setAccent, notificationsEnabled, setNotificationsEnabled }) {
+function SettingsScreen({
+  state,
+  accent,
+  onAdd,
+  onEdit,
+  onDelete,
+  onRestore,
+  onMove,
+  onExport,
+  onImport,
+  setAccent,
+  notificationsEnabled,
+  setNotificationsEnabled,
+}) {
+  const activeHabits = state.habits.filter((habit) => !habit.deletedAt);
+  const archivedHabits = state.habits.filter((habit) => Boolean(habit.deletedAt));
   return (
     <ScrollView contentContainerStyle={styles.scrollContent} showsVerticalScrollIndicator={false}>
       <ScreenHeader title="Settings" subtitle="Customize your tracker" />
@@ -712,14 +826,14 @@ function SettingsScreen({ state, accent, onAdd, onEdit, onDelete, setAccent, not
         <Pressable onPress={onAdd} style={[styles.smallAddButton, { backgroundColor: accent }]}><Text style={styles.smallAddText}>＋ Add</Text></Pressable>
       </View>
 
-      {state.habits.filter((habit) => !habit.deletedAt).length === 0 && (
+      {activeHabits.length === 0 && (
         <View style={styles.emptyCard}>
           <Text style={styles.emptyTitle}>No habits yet</Text>
           <Text style={styles.muted}>Add a habit to start tracking.</Text>
         </View>
       )}
 
-      {state.habits.filter((habit) => !habit.deletedAt).map((habit) => (
+      {activeHabits.map((habit, index) => (
         <View key={habit.id} style={styles.manageRow}>
           <View style={styles.habitLeft}>
             <View style={[styles.habitIcon, { backgroundColor: (habit.color || accent) + '20' }]}><Text style={styles.habitIconText}>{habit.icon || '✅'}</Text></View>
@@ -729,17 +843,65 @@ function SettingsScreen({ state, accent, onAdd, onEdit, onDelete, setAccent, not
             </View>
           </View>
           <View style={styles.manageActions}>
+            <Pressable onPress={() => onMove(habit.id, -1)} disabled={index === 0} style={[styles.reorderButton, index === 0 && styles.disabledAction]}>
+              <Text style={styles.reorderText}>↑</Text>
+            </Pressable>
+            <Pressable onPress={() => onMove(habit.id, 1)} disabled={index === activeHabits.length - 1} style={[styles.reorderButton, index === activeHabits.length - 1 && styles.disabledAction]}>
+              <Text style={styles.reorderText}>↓</Text>
+            </Pressable>
             <Pressable onPress={() => onEdit(habit)} style={styles.editButton}><Text style={[styles.editButtonText, { color: accent }]}>Edit</Text></Pressable>
             <Pressable onPress={() => onDelete(habit.id)} style={styles.deleteButton}><Text style={styles.deleteText}>Delete</Text></Pressable>
           </View>
         </View>
       ))}
 
+      <View style={styles.sectionHeaderRow}>
+        <View>
+          <Text style={styles.sectionTitle}>Archived habits</Text>
+          <Text style={styles.muted}>History is kept when a habit is archived.</Text>
+        </View>
+      </View>
+
+      {archivedHabits.length === 0 ? (
+        <View style={styles.emptyCard}>
+          <Text style={styles.muted}>No archived habits.</Text>
+        </View>
+      ) : archivedHabits.map((habit) => (
+        <View key={habit.id} style={styles.manageRow}>
+          <View style={styles.habitLeft}>
+            <View style={[styles.habitIcon, { backgroundColor: (habit.color || accent) + '20' }]}><Text style={styles.habitIconText}>{habit.icon || '✅'}</Text></View>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.habitName}>{habit.name}</Text>
+              <Text style={styles.muted}>Archived {formatDate(habit.deletedAt, { month: 'short', day: 'numeric', year: 'numeric' })}</Text>
+            </View>
+          </View>
+          <Pressable onPress={() => onRestore(habit.id)} style={[styles.restoreButton, { borderColor: accent }]}>
+            <Text style={[styles.restoreText, { color: accent }]}>Restore</Text>
+          </Pressable>
+        </View>
+      ))}
+
+      <Text style={styles.sectionTitle}>Backup</Text>
+      <View style={styles.backupCard}>
+        <Text style={styles.habitName}>Keep a copy of your tracker</Text>
+        <Text style={styles.muted}>Export all habits and completion history as JSON. Importing a backup replaces the data on this device.</Text>
+        <View style={styles.backupActions}>
+          <Pressable onPress={onExport} style={[styles.secondaryButton, styles.backupButton]}>
+            <Text style={styles.secondaryButtonText}>Export backup</Text>
+          </Pressable>
+          <Pressable onPress={onImport} style={[styles.primaryButton, styles.backupButton, { backgroundColor: accent }]}>
+            <Text style={styles.primaryButtonText}>Import backup</Text>
+          </Pressable>
+        </View>
+      </View>
+
       <View style={styles.infoCard}>
         <Text style={styles.cardTitle}>Tracker behavior</Text>
         <Text style={styles.infoText}>• The Today page shows only today. Past days are edited from Statistics.</Text>
         <Text style={styles.infoText}>• Statistics contains the full calendar for any month you want to inspect.</Text>
         <Text style={styles.infoText}>• Adding a habit starts it today; deleting it archives the past instead of erasing history.</Text>
+        <Text style={styles.infoText}>• Use the arrows to reorder habits. Archived habits can be restored at any time.</Text>
+        <Text style={styles.infoText}>• Streaks do not reset until the end of the current day.</Text>
         <Text style={styles.infoText}>• Everything is stored locally on your Android device.</Text>
       </View>
     </ScrollView>
@@ -797,6 +959,39 @@ function HabitModal({ visible, editing, draft, setDraft, accent, onClose, onSave
   );
 }
 
+function BackupModal({ visible, draft, setDraft, onClose, onImport }) {
+  return (
+    <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
+      <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={styles.modalBackdrop}>
+        <View style={styles.modalCard}>
+          <Text style={styles.modalTitle}>Import backup</Text>
+          <Text style={styles.muted}>Paste the JSON created by Export backup.</Text>
+          <TextInput
+            autoFocus
+            multiline
+            value={draft}
+            onChangeText={setDraft}
+            placeholder={'{\n  "habits": [],\n  "completions": {}\n}'}
+            placeholderTextColor="#626979"
+            style={styles.backupInput}
+            textAlignVertical="top"
+            autoCapitalize="none"
+            autoCorrect={false}
+          />
+          <View style={styles.modalActions}>
+            <Pressable onPress={onClose} style={styles.secondaryButton}>
+              <Text style={styles.secondaryButtonText}>Cancel</Text>
+            </Pressable>
+            <Pressable onPress={onImport} style={styles.primaryButton}>
+              <Text style={styles.primaryButtonText}>Import JSON</Text>
+            </Pressable>
+          </View>
+        </View>
+      </KeyboardAvoidingView>
+    </Modal>
+  );
+}
+
 const styles = StyleSheet.create({
   safeArea: { flex: 1, backgroundColor: '#050608' },
   appShell: { flex: 1, backgroundColor: '#050608' },
@@ -806,6 +1001,9 @@ const styles = StyleSheet.create({
   header: { marginBottom: 20, paddingTop: 8 },
   appTitle: { color: '#ffffff', fontSize: 31, fontWeight: '800', letterSpacing: -0.9 },
   headerSubtitle: { color: '#747985', fontSize: 14, marginTop: 5 },
+  todayHeaderRow: { flexDirection: 'row', alignItems: 'flex-start' },
+  headerAddButton: { height: 38, borderRadius: 13, paddingHorizontal: 12, alignItems: 'center', justifyContent: 'center', marginTop: 9, marginLeft: 10 },
+  headerAddText: { color: '#ffffff', fontSize: 12, fontWeight: '800' },
 
 
 
@@ -879,10 +1077,18 @@ const styles = StyleSheet.create({
   smallAddText: { color: '#ffffff', fontSize: 12, fontWeight: '800' },
   manageRow: { minHeight: 74, padding: 12, borderRadius: 18, backgroundColor: '#0d0f12', borderWidth: 1, borderColor: '#1d2026', marginBottom: 10, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
   manageActions: { flexDirection: 'row', alignItems: 'center', marginLeft: 8 },
+  reorderButton: { width: 28, height: 30, borderRadius: 9, backgroundColor: '#1b1e24', alignItems: 'center', justifyContent: 'center', marginLeft: 4 },
+  reorderText: { color: '#d8dbe2', fontSize: 17, fontWeight: '800', lineHeight: 19 },
+  disabledAction: { opacity: 0.25 },
   editButton: { padding: 8 },
   editButtonText: { fontSize: 12, fontWeight: '800' },
   deleteButton: { padding: 8 },
   deleteText: { color: '#ff6a6a', fontSize: 12, fontWeight: '700' },
+  restoreButton: { borderWidth: 1, borderRadius: 10, paddingHorizontal: 11, paddingVertical: 8 },
+  restoreText: { fontSize: 12, fontWeight: '800' },
+  backupCard: { padding: 16, borderRadius: 18, backgroundColor: '#0d0f12', borderWidth: 1, borderColor: '#1d2026', marginBottom: 24 },
+  backupActions: { flexDirection: 'row', gap: 10, marginTop: 14 },
+  backupButton: { minHeight: 48, paddingHorizontal: 12 },
   settingRow: { minHeight: 72, padding: 14, borderRadius: 18, backgroundColor: '#0d0f12', borderWidth: 1, borderColor: '#1d2026', marginBottom: 24, flexDirection: 'row', alignItems: 'center' },
   toggle: { width: 46, height: 28, borderRadius: 15, backgroundColor: '#2a2d33', padding: 3, justifyContent: 'center' },
   toggleKnob: { width: 22, height: 22, borderRadius: 11, backgroundColor: '#ffffff' },
@@ -897,6 +1103,7 @@ const styles = StyleSheet.create({
   modalTitle: { color: '#ffffff', fontSize: 22, fontWeight: '900', marginBottom: 14 },
   modalLabel: { color: '#a0a5ad', fontSize: 11, fontWeight: '800', marginTop: 14, marginBottom: 7 },
   input: { height: 52, borderRadius: 16, backgroundColor: '#080a0c', borderWidth: 1, borderColor: '#262a31', color: '#ffffff', paddingHorizontal: 15, fontSize: 15 },
+  backupInput: { height: 190, borderRadius: 16, backgroundColor: '#080a0c', borderWidth: 1, borderColor: '#262a31', color: '#ffffff', paddingHorizontal: 15, paddingVertical: 14, fontSize: 12, lineHeight: 18, marginTop: 14 },
   modalColors: { flexDirection: 'row', gap: 10, marginTop: 5 },
   modalColor: { width: 34, height: 34, borderRadius: 10, alignItems: 'center', justifyContent: 'center' },
   modalColorActive: { borderWidth: 2, borderColor: '#ffffff' },
